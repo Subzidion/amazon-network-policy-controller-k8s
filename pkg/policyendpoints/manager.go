@@ -180,23 +180,48 @@ func (m *policyEndpointsManager) processPolicyEndpoints(pes []policyinfo.PolicyE
 	return newPEs
 }
 
-// the controller should consolidate the ingress and egress endpoints and put entries to one CIDR if they belong to a same CIDR
+// the controller should consolidate the ingress and egress endpoints
 func combineRulesEndpoints(ingressEndpoints []policyinfo.EndpointInfo) []policyinfo.EndpointInfo {
+	var result []policyinfo.EndpointInfo
 	combinedMap := make(map[string]policyinfo.EndpointInfo)
+
 	for _, iep := range ingressEndpoints {
-		if _, ok := combinedMap[string(iep.CIDR)]; ok {
-			tempIEP := combinedMap[string(iep.CIDR)]
-			tempIEP.Ports = append(combinedMap[string(iep.CIDR)].Ports, iep.Ports...)
-			tempIEP.Except = append(combinedMap[string(iep.CIDR)].Except, iep.Except...)
-			combinedMap[string(iep.CIDR)] = tempIEP
+		cidrKey := string(iep.CIDR)
+		if existing, ok := combinedMap[cidrKey]; ok {
+			// Only combine if exception lists are identical to preserve rule intent
+			if exceptionsEqual(existing.Except, iep.Except) {
+				existing.Ports = append(existing.Ports, iep.Ports...)
+				combinedMap[cidrKey] = existing
+			} else {
+				// Different exceptions - keep both separate to preserve intent
+				result = append(result, existing)
+				delete(combinedMap, cidrKey)
+				result = append(result, iep)
+			}
 		} else {
-			combinedMap[string(iep.CIDR)] = iep
+			combinedMap[cidrKey] = iep
 		}
 	}
-	if len(combinedMap) > 0 {
-		return maps.Values(combinedMap)
+
+	// Add remaining combined endpoints
+	for _, ep := range combinedMap {
+		result = append(result, ep)
 	}
-	return nil
+
+	return result
+}
+
+// exceptionsEqual checks if two exception lists are identical
+func exceptionsEqual(a, b []policyinfo.NetworkAddress) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, addr := range a {
+		if addr != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *policyEndpointsManager) newPolicyEndpoint(policy *networking.NetworkPolicy,

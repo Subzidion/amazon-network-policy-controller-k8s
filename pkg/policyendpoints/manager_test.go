@@ -553,3 +553,36 @@ func Test_processPolicyEndpoints(t *testing.T) {
 	assert.Equal(t, 3, len(pes[0].Spec.Ingress[0].Ports))
 	assert.Equal(t, 2, len(pes[0].Spec.Egress[0].Ports))
 }
+
+func TestCombineRulesEndpoints_MultipleEgressRules(t *testing.T) {
+	protocolUDP := corev1.ProtocolUDP
+	port53 := int32(53)
+
+	// This test demonstrates the bug where combineRulesEndpoints incorrectly
+	// merged contradictory egress rules with the same CIDR,
+	// see https://github.com/aws/amazon-network-policy-controller-k8s/issues/146
+	endpoints := []policyinfo.EndpointInfo{
+		{
+			// First rule: allow traffic to internet, except private ranges
+			CIDR: "0.0.0.0/0",
+			Except: []policyinfo.NetworkAddress{
+				"10.0.0.0/8",
+				"172.16.0.0/12",
+				"192.168.0.0/16",
+			},
+			Ports: []policyinfo.Port{},
+		},
+		{
+			// Second rule: allow DNS traffic to any destination (including private ranges)
+			CIDR:   "0.0.0.0/0",
+			Except: []policyinfo.NetworkAddress{}, // No exceptions = allow to anywhere
+			Ports: []policyinfo.Port{
+				{Protocol: &protocolUDP, Port: &port53},
+			},
+		},
+	}
+
+	combined := combineRulesEndpoints(endpoints)
+
+	assert.Len(t, combined, 2, "Should keep contradictory rules separate, not combine them")
+}
