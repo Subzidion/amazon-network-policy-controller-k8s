@@ -1176,3 +1176,136 @@ func TestEndpointsResolver_ExcludesTerminalPods(t *testing.T) {
 	assert.Equal(t, "10.0.0.1", string(podEndpoints[0].PodIP))
 	assert.Equal(t, "running-pod", podEndpoints[0].Name)
 }
+
+func TestEndpointsResolver_BugReproduction_RealClusterScenario(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := mock_client.NewMockClient(ctrl)
+	resolver := NewEndpointsResolver(mockClient, logr.New(&log.NullLogSink{}))
+
+	// Reproduce exact scenario from our cluster: 1 running, 2 succeeded, 7 failed pods
+	runningPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "whoami-7c7f4944c6-9trkf",
+			Namespace: "networkpolicy-test",
+			Labels:    map[string]string{"app": "whoami"},
+		},
+		Status: corev1.PodStatus{
+			PodIP: "10.244.0.12",
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	succeededPod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-allowed-7qz9k",
+			Namespace: "networkpolicy-test",
+			Labels:    map[string]string{"test": "allowed"},
+		},
+		Status: corev1.PodStatus{
+			PodIP: "10.244.0.13",
+			Phase: corev1.PodSucceeded,
+		},
+	}
+
+	succeededPod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-fix-allowed-klxjx",
+			Namespace: "networkpolicy-test",
+			Labels:    map[string]string{"test": "allowed"},
+		},
+		Status: corev1.PodStatus{
+			PodIP: "10.244.0.23",
+			Phase: corev1.PodSucceeded,
+		},
+	}
+
+	// Create 7 failed pods like in our cluster
+	failedPods := make([]corev1.Pod, 7)
+	failedIPs := []string{"10.244.0.14", "10.244.0.15", "10.244.0.16", "10.244.0.17", "10.244.0.18", "10.244.0.19", "10.244.0.20"}
+	failedNames := []string{"test-blocked-q22g7", "test-blocked-kr2qj", "test-blocked-qlpwn", "test-blocked-42zwl", "test-blocked-hnmkp", "test-blocked-tmjhx", "test-blocked-vvvdw"}
+
+	for i := 0; i < 7; i++ {
+		failedPods[i] = corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      failedNames[i],
+				Namespace: "networkpolicy-test",
+				Labels:    map[string]string{"test": "blocked"},
+			},
+			Status: corev1.PodStatus{
+				PodIP: failedIPs[i],
+				Phase: corev1.PodFailed,
+			},
+		}
+	}
+
+	// Build the complete pod list (10 pods total)
+	allPods := []corev1.Pod{*runningPod, *succeededPod1, *succeededPod2}
+	allPods = append(allPods, failedPods...)
+
+	// Mock the List calls properly - return different pods based on label selector
+	mockClient.EXPECT().List(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+			// Check the label selector to return appropriate pods
+			if len(opts) > 0 {
+				if listOpt, ok := opts[0].(*client.ListOptions); ok && listOpt.LabelSelector != nil {
+					selector := listOpt.LabelSelector.String()
+					if selector == "test=allowed" {
+						// Ingress rule looking for pods with test=allowed - return only succeeded pods
+						list.(*corev1.PodList).Items = []corev1.Pod{*succeededPod1, *succeededPod2}
+						return nil
+					}
+				}
+			}
+			// Default case: podSelector: {} (empty) - return all pods
+			list.(*corev1.PodList).Items = allPods
+			return nil
+		}).AnyTimes()
+
+	// NetworkPolicy with empty podSelector (matches all pods in namespace)
+	// and ingress rule allowing traffic from pods with test=allowed label
+	policy := &networking.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ingress",
+			Namespace: "networkpolicy-test",
+		},
+		Spec: networking.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{}, // Empty selector matches all pods
+			PolicyTypes: []networking.PolicyType{networking.PolicyTypeIngress},
+			Ingress: []networking.NetworkPolicyIngressRule{
+				{
+					From: []networking.NetworkPolicyPeer{
+						{
+							PodSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{"test": "allowed"},
+							},
+						},
+					},
+					Ports: []networking.NetworkPolicyPort{
+						{
+							Protocol: &[]corev1.Protocol{corev1.ProtocolTCP}[0],
+							Port:     &intstr.IntOrString{Type: intstr.Int, IntVal: 80},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ingressEndpoints, egressEndpoints, podEndpoints, err := resolver.Resolve(context.Background(), policy)
+
+	assert.NoError(t, err)
+
+	assert.Len(t, podEndpoints, 1, "Should only include running pod in podSelectorEndpoints")
+	assert.Equal(t, "10.244.0.12", string(podEndpoints[0].PodIP))
+	assert.Equal(t, "whoami-7c7f4944c6-9trkf", podEndpoints[0].Name)
+	assert.Len(t, ingressEndpoints, 0, "Should NOT include completed pods with test=allowed in ingress endpoints")
+	assert.Len(t, egressEndpoints, 0, "Should have no egress endpoints")
+
+	t.Logf("Ingress endpoints count: %d (should be 0)", len(ingressEndpoints))
+	t.Logf("Egress endpoints count: %d", len(egressEndpoints))
+	for i, ing := range ingressEndpoints {
+		t.Logf("Ingress[%d]: %+v", i, ing)
+	}
+}
